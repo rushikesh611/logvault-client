@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 export interface LogEntry {
     timestamp?: string;
-    source: string;  // Added required source field
+    source: string;
     level: string;
     message: string;
     metadata?: Record<string, any>;
@@ -12,12 +12,20 @@ export interface LogVaultOptions {
     batchSize?: number;
     flushInterval?: number;
     requestTimeout?: number;
-    defaultSource?: string;  // Added default source option
+    defaultSource?: string;  // Fallback source name if API validation fails
+}
+
+interface SourceInfo {
+    id: string;
+    name: string;
+    userId: string;
 }
 
 export class LogVaultClient {
     private buffer: LogEntry[] = [];
     private timer: NodeJS.Timeout | null = null;
+    private sourceInfo: SourceInfo | null = null;
+    private sourceInfoPromise: Promise<SourceInfo | null> | null = null;
 
     constructor(
         private readonly apiKey: string,
@@ -26,17 +34,54 @@ export class LogVaultClient {
             batchSize?: number;
             flushInterval?: number;
             requestTimeout?: number;
-            defaultSource?: string;  // Added default source option
+            defaultSource?: string;
         } = {}
     ) {
         this.options = {
             batchSize: 100,
             flushInterval: 5000,
             requestTimeout: 5000,
-            defaultSource: 'default-client',  // Default source name
+            defaultSource: 'default-client',
             ...options
         };
+        // Initialize source info
+        this.initializeSourceInfo();
         this.startTimer();
+    }
+
+    private async initializeSourceInfo(): Promise<SourceInfo | null> {
+        if (this.sourceInfoPromise) return this.sourceInfoPromise;
+
+        this.sourceInfoPromise = new Promise(async (resolve) => {
+            try {
+                const response = await fetch(`${this.url}/validate`, {
+                    method: 'GET',
+                    headers: {
+                        'X-API-Key': this.apiKey
+                    }
+                });
+
+                if (response.ok) {
+                    const sourceInfo = await response.json() as SourceInfo;
+                    this.sourceInfo = sourceInfo;
+                    console.log('LogVault client initialized with source:', sourceInfo.name);
+                    resolve(sourceInfo);
+                } else {
+                    console.warn('Failed to fetch source info:', await response.text());
+                    resolve(null);
+                }
+            } catch (error) {
+                console.error('Error fetching source info:', error);
+                resolve(null);
+            }
+        });
+
+        return this.sourceInfoPromise;
+    }
+
+    private getSourceName(): string {
+        // Return source name from API or fall back to default
+        return this.sourceInfo?.name || this.options.defaultSource || 'unknown-source';
     }
 
     private startTimer() {
@@ -47,6 +92,11 @@ export class LogVaultClient {
 
     private async flush() {
         if (this.buffer.length === 0) return;
+
+        // Make sure we have source info before sending logs
+        if (!this.sourceInfo) {
+            await this.initializeSourceInfo();
+        }
 
         const logsToSend = [...this.buffer];
         this.buffer = [];
@@ -79,9 +129,15 @@ export class LogVaultClient {
     }
 
     async log(level: string, message: string, metadata: Record<string, any> = {}, source?: string) {
+        // Wait for source info if not already available
+        if (!this.sourceInfo && !this.sourceInfoPromise) {
+            await this.initializeSourceInfo();
+        }
+
         const logEntry: LogEntry = {
             timestamp: new Date().toISOString(),
-            source: source || metadata.source || this.options.defaultSource!,  // Use provided source or default
+            // Priority: 1. Explicit source, 2. Metadata source, 3. API source, 4. Default
+            source: source || metadata.source || this.getSourceName(),
             level,
             message,
             metadata: {
@@ -95,11 +151,18 @@ export class LogVaultClient {
             delete logEntry.metadata.source;
         }
 
+        // Add source ID from API validation if available
+        if (this.sourceInfo?.id && logEntry.metadata) {
+            logEntry.metadata.sourceId = this.sourceInfo.id;
+        }
+
         this.buffer.push(logEntry);
 
         if (this.buffer.length >= this.options.batchSize!) {
             await this.flush();
         }
+
+        return logEntry.metadata!.requestId;
     }
 
     async info(message: string, metadata: Record<string, any> = {}, source?: string) {
@@ -121,6 +184,7 @@ export class LogVaultClient {
     async close() {
         if (this.timer) {
             clearInterval(this.timer);
+            this.timer = null;
         }
         return this.flush();
     }
