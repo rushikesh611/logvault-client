@@ -13,8 +13,10 @@ jest.useFakeTimers();
 const setIntervalMock = jest.spyOn(global, 'setInterval');
 const clearIntervalMock = jest.spyOn(global, 'clearInterval');
 
-// Mock console.error
+// Mock console methods
 console.error = jest.fn();
+console.warn = jest.fn();
+console.log = jest.fn();
 
 describe('LogVaultClient', () => {
     let client: LogVaultClient;
@@ -28,7 +30,11 @@ describe('LogVaultClient', () => {
         (global.fetch as jest.Mock).mockReset();
         (global.fetch as jest.Mock).mockResolvedValue({
             ok: true,
-            json: async () => ({}),
+            json: async () => ({
+                id: 'source-123',
+                name: 'test-source',
+                userId: 'user-123'
+            }),
         });
     });
 
@@ -43,25 +49,54 @@ describe('LogVaultClient', () => {
             client = new LogVaultClient(apiKey, url);
             expect(client).toBeDefined();
             expect(setIntervalMock).toHaveBeenCalledWith(expect.any(Function), 5000);
+            // Verify API validation was called
+            expect(fetch).toHaveBeenCalledWith(
+                `${url}/validate`,
+                expect.objectContaining({
+                    method: 'GET',
+                    headers: { 'X-API-Key': apiKey }
+                })
+            );
         });
 
         test('should initialize with custom options', () => {
             client = new LogVaultClient(apiKey, url, {
                 batchSize: 50,
                 flushInterval: 10000,
-                requestTimeout: 3000
+                requestTimeout: 3000,
+                defaultSource: 'custom-source'
             });
             expect(client).toBeDefined();
             expect(setIntervalMock).toHaveBeenCalledWith(expect.any(Function), 10000);
         });
+        
+        test('should handle API validation failure', async () => {
+            (global.fetch as jest.Mock).mockResolvedValueOnce({
+                ok: false,
+                text: async () => 'Invalid API key'
+            });
+            
+            client = new LogVaultClient(apiKey, url);
+            
+            // Force sourceInfoPromise to resolve
+            // @ts-ignore - accessing private property for testing
+            await client['sourceInfoPromise'];
+            
+            expect(console.warn).toHaveBeenCalledWith(
+                'Failed to fetch source info:',
+                'Invalid API key'
+            );
+        });
     });
 
     describe('logging methods', () => {
-        beforeEach(() => {
+        beforeEach(async () => {
             client = new LogVaultClient(apiKey, url, { batchSize: 10 });
+            // Wait for source info to be loaded
+            await Promise.resolve();
         });
 
-        test('should add log entry to buffer', async () => {
+        test('should add log entry to buffer with correct metadata', async () => {
             const now = new Date();
             jest.spyOn(global, 'Date').mockImplementation(() => now as any);
             
@@ -71,6 +106,20 @@ describe('LogVaultClient', () => {
             // @ts-ignore - accessing private method for testing
             await client['flush']();
             
+            const expectedBody = JSON.stringify({
+                logs: [{
+                    timestamp: now.toISOString(),
+                    source: 'test-source',
+                    level: 'info',
+                    message: 'Test message',
+                    metadata: {
+                        key: 'value',
+                        requestId: 'mocked-uuid',
+                        sourceId: 'source-123'
+                    }
+                }]
+            });
+            
             expect(fetch).toHaveBeenCalledWith(
                 `${url}/logs`,
                 expect.objectContaining({
@@ -79,7 +128,7 @@ describe('LogVaultClient', () => {
                         'Content-Type': 'application/json',
                         'X-API-Key': apiKey
                     },
-                    body: expect.stringContaining('Test message')
+                    body: expectedBody
                 })
             );
         });
@@ -87,6 +136,11 @@ describe('LogVaultClient', () => {
         test('should flush buffer when it reaches batch size', async () => {
             // Configure client with small batch size
             client = new LogVaultClient(apiKey, url, { batchSize: 3 });
+            // Allow source info to load
+            await Promise.resolve();
+            
+            // Reset fetch mock after initialization
+            (global.fetch as jest.Mock).mockReset();
             
             // Add logs to fill the batch
             await client.info('Log 1');
@@ -99,6 +153,26 @@ describe('LogVaultClient', () => {
             await client.info('Log 3');
             
             expect(fetch).toHaveBeenCalledTimes(1);
+            expect(fetch).toHaveBeenCalledWith(
+                `${url}/logs`,
+                expect.any(Object)
+            );
+        });
+
+        test('should use provided source over API source', async () => {
+            await client.log('info', 'Message with source', {}, 'custom-source');
+            
+            // @ts-ignore - accessing private property for testing
+            expect(client['buffer'][0].source).toBe('custom-source');
+        });
+        
+        test('should use metadata source if no explicit source provided', async () => {
+            await client.log('info', 'Message with metadata source', { source: 'metadata-source' });
+            
+            // @ts-ignore - accessing private property for testing
+            expect(client['buffer'][0].source).toBe('metadata-source');
+            // Source should be removed from metadata
+            expect(client['buffer'][0].metadata?.source).toBeUndefined();
         });
 
         test('should use info level', async () => {
@@ -132,11 +206,20 @@ describe('LogVaultClient', () => {
             expect(client['buffer'][0].level).toBe('debug');
             expect(client['buffer'][0].message).toBe('Debug message');
         });
+        
+        test('should return requestId', async () => {
+            const requestId = await client.info('Info with request ID');
+            expect(requestId).toBe('mocked-uuid');
+        });
     });
 
     describe('flush behavior', () => {
-        beforeEach(() => {
+        beforeEach(async () => {
             client = new LogVaultClient(apiKey, url, { flushInterval: 60000 });
+            // Allow source info to load
+            await Promise.resolve();
+            // Reset fetch mock after initialization
+            (global.fetch as jest.Mock).mockReset();
         });
 
         test('should flush logs on interval', async () => {
@@ -188,27 +271,51 @@ describe('LogVaultClient', () => {
             await client.info('Test before close');
             await client.close();
             expect(clearIntervalMock).toHaveBeenCalled();
+            // Should attempt to flush logs on close
+            expect(fetch).toHaveBeenCalledTimes(1);
         });
     });
 
-    test('should respect request timeout option', async () => {
-        const abortSpy = jest.spyOn(AbortController.prototype, 'abort');
-        client = new LogVaultClient(apiKey, url, { requestTimeout: 1000 });
+    describe('timeout behavior', () => {
+        beforeEach(() => {
+            // Mock setTimeout and clearTimeout
+            jest.spyOn(global, 'setTimeout').mockImplementation(() => 123 as any);
+            jest.spyOn(global, 'clearTimeout');
+        });
         
-        // Add a log to trigger a flush
-        await client.info('Test log');
-        
-        // Mock fetch to not resolve
-        (global.fetch as jest.Mock).mockImplementationOnce(() => new Promise(() => {}));
-        
-        // Manually call flush
-        // @ts-ignore - accessing private method for testing
-        const flushPromise = client['flush']();
-        
-        // Advance timers to trigger the timeout
-        jest.advanceTimersByTime(1001);
-        
-        await Promise.resolve(); // Allow any pending promises to resolve
-        expect(abortSpy).toHaveBeenCalled();
+        test('should respect request timeout option', async () => {
+            // Mock AbortController
+            const mockAbort = jest.fn();
+            const mockAbortController = {
+                abort: mockAbort,
+                signal: {}
+            };
+            
+            // Replace the global AbortController with our mock
+            global.AbortController = jest.fn(() => mockAbortController) as any;
+            
+            client = new LogVaultClient(apiKey, url, { requestTimeout: 1000 });
+            
+            // Wait for source info to load
+            await Promise.resolve();
+            
+            // Add a log to the buffer
+            await client.info('Test log');
+            
+            // Mock fetch to never resolve
+            (global.fetch as jest.Mock).mockImplementationOnce(() => new Promise(() => {}));
+            
+            // Trigger flush manually
+            // @ts-ignore - accessing private method for testing
+            const flushPromise = client['flush']();
+            
+            // Call the timeout callback (the second argument to setTimeout)
+            const setTimeoutMock = global.setTimeout as unknown as jest.Mock;
+            const timeoutCallback = setTimeoutMock.mock.calls[0][0];
+            timeoutCallback();
+            
+            // The abort method should have been called
+            expect(mockAbort).toHaveBeenCalled();
+        });
     });
 });
