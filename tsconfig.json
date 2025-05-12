@@ -3,7 +3,12 @@
     "compilerOptions": {
         "outDir": "./dist",
         "sourceMap": true,
-        "strict": true
+        "strict": true,
+        "declaration": true,         // Generate .d.ts files
+        "declarationMap": true,      // Generate sourcemaps for .d.ts files
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "skipLibCheck": true
     },
     "include": [
         "src/**/*.ts"
